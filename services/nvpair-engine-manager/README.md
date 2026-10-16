@@ -6,7 +6,7 @@ SPDX-License-Identifier: Apache-2.0
 # nvpair-engine-manager
 
 A config-driven control plane for local inference engines. The bundled
-manifests support Ollama, LM Studio, and llama.cpp. It manages everything about
+manifests support Ollama, LM Studio, llama.cpp, and vLLM. It manages everything about
 an engine **except serving inference**: detect, user-mode install,
 start/stop/restart, health, and config-declared actions. Adding an engine
 is a JSON manifest, not code.
@@ -38,6 +38,54 @@ not enlarge the PAIR installer. llama.cpp keeps its `auto` GPU-layer policy:
 supported NVIDIA/Metal devices can accelerate, while the dynamic CPU backend
 remains the fallback. Hardware acceptance, not `/health` alone, is required to
 claim GPU activation.
+
+### vLLM
+
+The `vllm` manifest is Linux only (`linux/amd64` and `linux/arm64`; vLLM has no
+native Windows or macOS GPU path). It runs `vllm serve` on loopback port `8001`,
+and the proxy facade owns `8000`. vLLM serves **one model per process** and has
+no load, unload, pull or delete API, so the manifest declares only `list_models`
+and `loaded_models` (both `GET /v1/models`). Changing the model means editing the
+launch arguments and restarting the engine.
+
+The default launch serves `Qwen/Qwen2.5-0.5B-Instruct` through
+`--model <hugging-face-id>`; edit that argument to serve another model. Only
+`--host` and `--port` are managed controls, and there is no CORS control.
+The default launch also passes `--gpu-memory-utilization 0.5`: vLLM reserves 92%
+of GPU memory by default, even for a tiny model, which would starve every other
+engine on the machine. Raise it in the launch arguments for a larger model.
+The environment sets `VLLM_USE_FLASHINFER_SAMPLER=0`. vLLM's FlashInfer sampler
+compiles GPU kernels on first start, and that build cannot handle the spaces in
+PAIR's app-data folder (`Nvidia Corporation/Personal AI Router`), so the
+built-in sampler is used instead. As a side effect no CUDA toolkit or C++
+compiler is needed. The same limit means anything that forces a FlashInfer
+kernel build (for example choosing a FlashInfer attention backend) fails until
+the install can live on a path without spaces.
+Readiness polls `/health` for up to eight minutes while weights load.
+
+The model list is the Hugging Face cache (`~/.cache/huggingface/hub`), not what
+vLLM happens to be serving: `list_models` is an `hf_cache` action listing the
+complete, text-model-shaped downloads (see `MANIFEST.md`), and it works while
+vLLM is stopped. Peers and the proxy, though, are only told about the model being
+served (`advertised_models: loaded`), because the proxy routes a request to any
+node advertising its model and vLLM cannot answer for the others. `load_model`
+switches the served model: it writes `--model <id>` into the saved launch
+arguments and restarts vLLM on it, restoring the previous model if the new one
+does not start (for example it does not fit in GPU memory).
+
+Install is detect-first. `{install_dir}/venv/bin/vllm` (the managed install) and
+`~/.local/bin/vllm` are checked in that order, and the first one found is
+launched, so an existing install is adopted and nothing is downloaded. Otherwise
+the install downloads a sha256-pinned `uv` release, lets `uv` fetch a managed
+Python 3.12, creates `{install_dir}/venv` and installs a pinned `vllm` wheel from
+PyPI. No source build happens. The pinned wheel is a CUDA 13 build, so the install
+first checks that `nvidia-smi` exists, that the driver supports CUDA 13 or newer
+(it reads either the `CUDA UMD Version` or the older `CUDA Version` field), and
+that at least 15 GB of disk is free. It fails with a clear message otherwise,
+before downloading anything. The
+download is several GB, because `torch` and the CUDA libraries come with it.
+Model weights download from Hugging Face on first start into `~/.cache/huggingface`
+(`HF_HOME`), which no removal this service performs will delete.
 
 ## Communication
 
@@ -186,8 +234,14 @@ allowance on supported Windows systems. The deadline remains finite: if Ollama
 never serves its readiness endpoint, engine-manager stops the owned process and
 reports the failed start. On Unix, stopping an owned process sends SIGTERM to
 its process group, waits the manifest's `stop.grace_s` (five seconds by
-default), then escalates to SIGKILL; `signal:"kill"` skips the grace. Failed
-startup cleanup uses the same policy. On Windows, the windowless engines we
+default), then escalates to SIGKILL, which also takes any helper processes the
+engine forked (vLLM's `EngineCore` holds the GPU) that outlived it; `signal:"kill"`
+skips the grace. Failed startup cleanup uses the same policy. While the whole
+service is shutting down the grace is capped at three seconds, whatever the
+manifest says: the parent allows engine-manager only a few seconds to stop its
+engines before it kills it, and engine-manager cannot escalate once killed, so a
+longer grace would leave the engine orphaned (an engine still loading its model
+does not answer a polite signal at all). On Windows, the windowless engines we
 spawn cannot receive a graceful (non-`/F`) close, so stopping uses immediate
 `taskkill /T /F`.
 
@@ -204,7 +258,9 @@ would only collide on the port. Consequences worth knowing:
 - **An adopted engine has no child process the service owns**, so `engine:stop`
   (and `engine:restart`'s stop phase, and shutdown's cleanup) resolves the PID
   bound to the engine's port and terminates it **only when that process is
-  running the very binary NVPAIR manages for the engine** — reclaiming an orphan
+  running the very binary NVPAIR manages for the engine** (for an engine
+  installed as a Python package, such as vLLM, that is the interpreter running the
+  engine's script, read from the process's command line on Linux) — reclaiming an orphan
   a prior run left on our own managed port (e.g. an `ollama serve` on `11435`
   whose handle was lost after a crash). This is precise to the port, so a
   genuine third-party listener on a *different* port (Ollama's own desktop app
@@ -352,4 +408,11 @@ termination, console hiding) are the only build-tagged Go
 
 Shuts down on stdin EOF (parent closed the pipe), `SIGINT`/`SIGTERM`, or a
 `shutdown` JSON-RPC request — stopping any running engines first so none
-are orphaned.
+are orphaned. A signal shuts down at once even while stdin is idle and an engine
+is still starting; the start is cancelled and its process group force-killed
+within the three-second shutdown grace (see Process-mode stops above).
+
+`engine:status` and `engine:get-installed` never wait for a lifecycle operation
+(a start, stop, install or model switch can hold an engine for minutes): while
+one runs they report what is already known and the operation reports its own
+result.

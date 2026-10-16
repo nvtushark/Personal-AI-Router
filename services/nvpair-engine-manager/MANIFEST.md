@@ -238,7 +238,7 @@ probes.
 ### Actions
 
 Each action is a config-declared operation exposed over `engine:action`.
-Exactly one of `http`, `cmd`, or `remove_path`:
+Exactly one of `http`, `cmd`, `remove_path`, `hf_cache`, or `launch_model`:
 
 - **`http`** — call the engine's loopback control API. The caller's
   `params` are sent as the JSON request body by default. Set
@@ -254,6 +254,27 @@ Exactly one of `http`, `cmd`, or `remove_path`:
   action `params` as placeholders); the resolved target must stay under
   the declared root. Symlink escapes and missing targets are rejected.
   Does **not** require the engine to be running.
+- **`hf_cache`** — list the models in a Hugging Face hub cache directory.
+  `hf_cache.dir` is templated, normally `"{models_dir}/hub"`. The reply is
+  `{"data":[{"id","size"}]}`, so `result: {"array": "data", "field": "id"}`
+  turns it into a model list. A repository is listed when its snapshot is a
+  complete download holding a config, a tokenizer and weights: vision-only and
+  GGUF-only repositories, interrupted downloads (`.incomplete` blobs, shards
+  missing from the index or from a `-0000N-of-0000M` set, several unnumbered
+  weight files with no index) and links whose blob is gone are left out. This is
+  a check on file layout, not on whether the engine supports the architecture.
+  A missing directory is an empty cache. Does **not** require the engine to be
+  running.
+- **`launch_model`** — switch the model an engine serves, for an engine with no
+  load call because the model is a launch argument (vLLM). `launch_model.flag`
+  names the flag (`"--model"`). The action takes `{"model": "<id>"}` (a
+  Hugging Face id such as `org/name`; anything that could be read as a flag, a
+  path or a shell fragment is refused), writes it into the saved launch
+  settings exactly as the settings editor would, and restarts a running engine
+  on it. If the new model does not come up, the previous one is restored and the
+  error says so; a stopped engine only has its saved launch changed, and asking
+  for the model already in the launch arguments restarts nothing. Requires
+  `runtime.editable_launch` and `runtime.ready` on every platform.
 
 An optional **`result`** declares how `engine:models` extracts a normalized
 name list from the action's JSON response: `array` is the top-level array
@@ -312,6 +333,14 @@ placeholder before the action runs:
   `owner/repo` pull key, or an on-disk path) to concrete files under the
   declared `remove_path.root` via `lms ls --json`. When no indexed file
   matches, the runner falls back to `{root}/{model}` if that path exists.
+
+A manifest-level **`advertised_models`** (`"list"`, the default, or `"loaded"`)
+chooses what the node tells its peers and its own proxy it can serve. The proxy
+sends a request to any node advertising the model, so an engine that serves one
+model per process sets `"loaded"` and advertises only `loaded_models`, even when
+its `list_models` offers many models it could be switched to. With `"loaded"`,
+`list_models` is not queried for `engine:models`, and a `loaded_models` action is
+required.
 
 An optional **`restart_after`** restarts the engine once the action succeeds.
 Declare it on an action that changes state the engine only reads at startup:
@@ -398,7 +427,10 @@ path, an `uninstall` block sets neither `run` nor `remove`, `uninstall.remove`
 is present without a `models_dir` to preserve, an `uninstall.remove` target is
 the model store or inside it (whether spelled literally or as `{models_dir}`),
 an action sets none or more than one of
-`http`/`cmd`/`remove_path`, a `remove_path` action omits `root` or
+`http`/`cmd`/`remove_path`/`hf_cache`/`launch_model`, an `hf_cache` action omits
+`dir`, a `launch_model` flag is not a flag or a platform lacks
+`editable_launch` or `ready`, `advertised_models` is unknown or `"loaded"`
+without a `loaded_models` action, a `remove_path` action omits `root` or
 `path`, `http.params_in` is not `body` or `query`, a `result` is set without
 both `array` and `field` (or a
 `result.match` without both `match.field` and a non-empty `match.in`), or
@@ -526,5 +558,5 @@ Caveats worth encoding when authoring these:
 - **Model store location**: leave each engine's model cache at the engine's own default — `~/.ollama`, `~/.llamacpp`, `~/.lmstudio/models` — and declare that path as `models_dir`. Never point one inside `{install_dir}` or anywhere else under the app data root: `uninstall` skips `models_dir`, but the app-level "remove all data" uninstall deletes the entire app data root and nothing can exempt a subdirectory of it. See Model stores.
 - **llama.cpp** ships prebuilt archives with **published SHA-256s**, so it's an ideal checksum-pinned `fetch`+`run` target (no placeholder SHA needed).
 - **LM Studio** model dir is settings-controlled (no documented relocation env); surface its config as flags/API, not env.
-- **vLLM**: native Windows is unsupported (WSL only); the bind is a flag, not env.
+- **vLLM**: native Windows is unsupported (WSL only); the bind is a flag, not env. The bundled `vllm.json` is the reference: it passes the model as `--model`, since manifest `runtime.args` have no `{model}` token, and installs through a sha256-pinned `uv` bootstrap with a detect-first path.
 - **GPT4All**: no first-class headless CLI today — out of scope for a config-only manager unless targeting its Python SDK.
