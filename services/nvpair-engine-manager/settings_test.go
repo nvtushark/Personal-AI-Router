@@ -835,3 +835,54 @@ func TestSettings_SupportsEngineWithoutStartupSubcommand(t *testing.T) {
 	require.Empty(t, preview.Errors, "engine without subcommand rejected (%v)", preview)
 	require.Equal(t, []string{"--future-option=opaque"}, preview.Args, "engine without subcommand rejected (%v)", preview)
 }
+
+// The broker refreshes every engine's settings in turn while holding its own
+// settings lock, and a vLLM start holds that engine's lifecycle lock for
+// minutes. The refresh's read reports the engine busy instead of waiting, and
+// the port check another engine's Apply makes reads the port without waiting.
+// A read for the engine itself still waits, so it never sees an operation half
+// done.
+func TestLaunchSettingsIfIdle_ReportsABusyEngineInsteadOfWaiting(t *testing.T) {
+	e := settingsExecutor(t, false)
+	want, err := e.LaunchSettings("fake")
+	require.NoError(t, err)
+	st := settingsState(t, e)
+	st.opMu.Lock() // a start is in flight
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, err := e.LaunchSettingsIfIdle("fake")
+		assert.ErrorIs(t, err, errLaunchBusy)
+		port, err := e.ConfiguredPort("fake")
+		assert.NoError(t, err)
+		assert.Equal(t, want.ServerPort, port)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		require.FailNow(t, "a background read waited for the operation in flight")
+	}
+
+	waited := make(chan settings.LaunchState, 1)
+	go func() {
+		state, err := e.LaunchSettings("fake")
+		assert.NoError(t, err)
+		waited <- state
+	}()
+	select {
+	case <-waited:
+		require.FailNow(t, "the engine's own read did not wait for the operation in flight")
+	case <-time.After(200 * time.Millisecond):
+	}
+	st.opMu.Unlock()
+	select {
+	case state := <-waited:
+		assert.Equal(t, want, state)
+	case <-time.After(2 * time.Second):
+		require.FailNow(t, "the engine's own read never finished")
+	}
+	state, err := e.LaunchSettingsIfIdle("fake")
+	require.NoError(t, err)
+	assert.Equal(t, want, state, "an idle engine's background read is the same as its own read")
+}

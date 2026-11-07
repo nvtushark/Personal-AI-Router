@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"reflect"
@@ -140,6 +141,40 @@ func (e *Executor) LaunchSettings(engine string) (settings.LaunchState, error) {
 	st.opMu.Lock()
 	defer st.opMu.Unlock()
 	return e.launchStateLocked(engine, st), nil
+}
+
+// errLaunchBusy answers a background read of an engine's launch settings while
+// an operation on that engine is in flight.
+var errLaunchBusy = errors.New("the engine is busy with another operation")
+
+// LaunchSettingsIfIdle is LaunchSettings for a background refresh. Rather than
+// wait out an operation in flight on this engine, which for a vLLM start can be
+// minutes, it reports the engine busy, as StatusAtPort does for a status read.
+// The caller keeps what it last read and reads again later; it never sees an
+// operation half done.
+func (e *Executor) LaunchSettingsIfIdle(engine string) (settings.LaunchState, error) {
+	st, err := e.state(engine)
+	if err != nil {
+		return settings.LaunchState{}, err
+	}
+	if !st.opMu.TryLock() {
+		return settings.LaunchState{}, errLaunchBusy
+	}
+	defer st.opMu.Unlock()
+	return e.launchStateLocked(engine, st), nil
+}
+
+// ConfiguredPort is the engine's configured server port. Every change to it is
+// made under st.mu, so it is read without waiting for an operation on the
+// engine: checking another engine's port choice needs only this port.
+func (e *Executor) ConfiguredPort(engine string) (int, error) {
+	st, err := e.state(engine)
+	if err != nil {
+		return 0, err
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.plat.Runtime.Port, nil
 }
 
 // launchCORSAssignments uses the same mandatory-control reader as preview.

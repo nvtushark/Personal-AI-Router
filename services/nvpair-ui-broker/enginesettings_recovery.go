@@ -179,7 +179,7 @@ func (b *Broker) reconcileLegacySettingsLocked() {
 	changed := false
 	for engine, record := range b.engineSettings {
 		before := record.Snapshot
-		after, err := b.settingsSnapshotLocked(ctx, engine)
+		after, err := b.refreshSettingsSnapshotLocked(ctx, engine)
 		if err == nil && before != after {
 			changed = true
 		}

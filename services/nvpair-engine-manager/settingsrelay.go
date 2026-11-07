@@ -94,8 +94,8 @@ func (m *Manager) handleSettingsMessage(ctx context.Context, msg *Message) bool 
 			}
 			ports := []port{}
 			for _, name := range m.exec.reg.Names() {
-				if launch, err := m.exec.LaunchSettings(name); err == nil {
-					ports = append(ports, port{name, launch.ServerPort})
+				if p, err := m.exec.ConfiguredPort(name); err == nil {
+					ports = append(ports, port{name, p})
 				}
 			}
 			m.respondOrErr(msg, map[string]any{"engines": ports}, nil)
@@ -109,7 +109,19 @@ func (m *Manager) handleSettingsMessage(ctx context.Context, msg *Message) bool 
 			}
 			switch msg.Method {
 			case "engine:get-launch":
-				result, err := m.exec.LaunchSettings(p.Engine)
+				// ifIdle marks the broker's background refresh, which must not
+				// wait for an operation on this engine to finish.
+				var read struct {
+					IfIdle bool `json:"ifIdle"`
+				}
+				_ = json.Unmarshal(msg.Params, &read)
+				var result settings.LaunchState
+				var err error
+				if read.IfIdle {
+					result, err = m.exec.LaunchSettingsIfIdle(p.Engine)
+				} else {
+					result, err = m.exec.LaunchSettings(p.Engine)
+				}
 				m.respondOrErr(msg, result, err)
 			case "engine:preview-launch":
 				result, err := m.exec.PreviewLaunch(p)

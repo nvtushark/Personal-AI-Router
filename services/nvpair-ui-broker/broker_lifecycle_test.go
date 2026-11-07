@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"nvpair-shared/engines"
+	settings "nvpair-shared/enginesettings"
 )
 
 // TestClusterManagerConfigDirTracksBrokerClusterDir pins the invariant that keeps
@@ -447,4 +448,68 @@ func TestRelayToEngine_KeepsAStartThatAssignsAPortBehindTheSettingsLock(t *testi
 	case <-time.After(5 * time.Second):
 		require.FailNow(t, "the Start that assigns a port never went ahead once the lock was free")
 	}
+}
+
+// After every Start, Stop and Restart the broker reconciles the settings
+// journal for each engine while it holds the settings lock. An engine whose
+// start is still in flight, such as vLLM loading for minutes, used to make that
+// reconcile wait out its whole budget, holding the lock, and with it every
+// other engine's settings and port changes, for that long. A busy engine is now
+// skipped and read again on the next refresh.
+func TestReconcileLegacySettings_SkipsAnEngineThatIsStillStarting(t *testing.T) {
+	worker, engineManager := newTestRPCWorkerPipe(t)
+	b := &Broker{engineSettingsLoaded: true}
+	b.setEngineMgr(worker)
+	b.engineSettings = map[string]*engineSettingsRecord{}
+	for _, engine := range []string{"vllm", "llamacpp"} {
+		b.engineSettings[engine] = &engineSettingsRecord{Receipts: map[string]settingsReceipt{}, Snapshot: settingsSnapshotFixture(engine)}
+	}
+	go func() {
+		for {
+			request, err := engineManager.Read()
+			if err != nil {
+				return
+			}
+			if !request.IsRequest() {
+				continue
+			}
+			var p struct {
+				Engine string `json:"engine"`
+				IfIdle bool   `json:"ifIdle"`
+			}
+			_ = json.Unmarshal(request.Params, &p)
+			switch {
+			case p.Engine != "vllm":
+				_ = engineManager.Respond(request.ID, launchStateFixture(p.Engine))
+			case p.IfIdle:
+				_ = engineManager.RespondError(request.ID, -32000, "the engine is busy with another operation")
+			default:
+				// vLLM is still starting: a read that waits gets no answer.
+			}
+		}
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		b.engineConfigMu.Lock()
+		defer b.engineConfigMu.Unlock()
+		b.reconcileLegacySettingsLocked()
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		require.FailNow(t, "the reconcile waited for vLLM's start while holding the settings lock")
+	}
+}
+
+// settingsSnapshotFixture is a settled journal entry that launchStateFixture
+// matches, so reconciling it changes nothing and saves nothing.
+func settingsSnapshotFixture(engine string) settings.Snapshot {
+	return settings.Snapshot{Engine: engine, Revision: 1, AppliedRevision: 1, Phase: "idle", Format: "pair-arguments-v1",
+		Settings: settings.Config{ServerPort: 18001, ProxyPort: 18000, LaunchText: "--fixture-option"}}
+}
+
+func launchStateFixture(engine string) settings.LaunchState {
+	return settings.LaunchState{Engine: engine, ServerPort: 18001, EffectivePort: 18001, LaunchText: "--fixture-option", Editable: true, Format: "pair-arguments-v1"}
 }

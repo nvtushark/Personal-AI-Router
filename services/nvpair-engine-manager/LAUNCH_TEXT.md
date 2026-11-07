@@ -142,6 +142,13 @@ The broker-facing internal methods are `engine:get-launch`,
 `engine:configure-launch`. UI/headless clients use the combined broker API
 documented in [ENGINE_SETTINGS.md](../nvpair-ui-broker/ENGINE_SETTINGS.md).
 
+`engine:get-launch` waits for an operation in flight on the engine, such as a
+start, so it never reports one half done. With `"ifIdle": true` it instead
+answers at once that the engine is busy; the broker's background refresh of
+every engine uses this, so a vLLM start that takes minutes does not hold back
+the other engines' settings. `engine:configured-ports` reads only the ports and
+never waits.
+
 Tests cover grammar and normalization, exact argv received by a real isolated
 child process, both lifecycle modes, preservation of override fields, reset to
 defaults, platform precedence and replacement of an existing settings file.

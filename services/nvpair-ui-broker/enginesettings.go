@@ -177,7 +177,23 @@ func isEngineDiscoveryService(service noderec.ServiceKey) bool {
 	return false
 }
 
+// settingsSnapshotLocked reads one engine's settings for a request about that
+// engine, waiting for an operation in flight on it to finish first.
 func (b *Broker) settingsSnapshotLocked(ctx context.Context, engine string) (settings.Snapshot, error) {
+	return b.readSettingsSnapshotLocked(ctx, engine, false)
+}
+
+// refreshSettingsSnapshotLocked is the background refresh of one engine's
+// settings. It runs under engineConfigMu for every engine in turn, so it does
+// not wait for an operation in flight: a vLLM start can take minutes, and
+// waiting would hold the lock, and every other engine's settings, that long.
+// A busy engine reports an error and keeps its last snapshot until the next
+// refresh.
+func (b *Broker) refreshSettingsSnapshotLocked(ctx context.Context, engine string) (settings.Snapshot, error) {
+	return b.readSettingsSnapshotLocked(ctx, engine, true)
+}
+
+func (b *Broker) readSettingsSnapshotLocked(ctx context.Context, engine string, ifIdle bool) (settings.Snapshot, error) {
 	if _, ok := engineProxyProfileFor(engine); !ok {
 		return settings.Snapshot{}, fmt.Errorf("this engine does not support settings")
 	}
@@ -185,7 +201,7 @@ func (b *Broker) settingsSnapshotLocked(ctx context.Context, engine string) (set
 		return settings.Snapshot{}, err
 	}
 	var launch settings.LaunchState
-	if err := b.settingsWorkerCall(ctx, "engine:get-launch", map[string]string{"engine": engine}, &launch); err != nil {
+	if err := b.settingsWorkerCall(ctx, "engine:get-launch", map[string]any{"engine": engine, "ifIdle": ifIdle}, &launch); err != nil {
 		return settings.Snapshot{}, err
 	}
 	proxyPort := 0
@@ -722,7 +738,7 @@ func (b *Broker) refreshEngineSettings(ctx context.Context) {
 					if r := b.engineSettings[engine]; r != nil {
 						before = r.Snapshot
 					}
-					after, err := b.settingsSnapshotLocked(readCtx, engine)
+					after, err := b.refreshSettingsSnapshotLocked(readCtx, engine)
 					if err == nil && before != after {
 						changed = true
 					}
