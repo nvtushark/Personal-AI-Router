@@ -3432,22 +3432,25 @@ func (b *Broker) relayToEngineNow(msg *Message) {
 
 	requestedEngine, requestedPort, isEnginePortAssignment := enginePortAssignmentRequest(msg.Method, msg.Params)
 	switch {
-	case msg.Method == "engine:stop":
-		// A Stop must reach the engine manager while a Start is still waiting for
-		// readiness, which can take minutes, because cancelling that Start is
-		// what it is for. The Start holds the lock for that whole time, so a
-		// Stop that waited for it would only arrive after the Start had finished
-		// on its own. A Stop changes no launch settings, so it takes the lock
-		// only afterwards, to reconcile, once its reply is sent.
+	case isEnginePortAssignment:
+		// Assigning a port changes the launch settings the journal records, so
+		// it holds the lock across the call, as a settings Apply does around
+		// its own checks.
+		b.engineConfigMu.Lock()
+		defer b.engineConfigMu.Unlock()
+		defer b.reconcileLegacySettingsLocked()
+	case msg.Method == "engine:stop" || msg.Method == "engine:start" || msg.Method == "engine:restart":
+		// These change no launch settings, and the engine manager already
+		// orders operations on one engine, so they take the lock only
+		// afterwards, to reconcile, once the reply is sent. Holding it for the
+		// call would hold back every other engine for as long as this one takes
+		// to become ready, which for vLLM can be minutes: a Stop could not
+		// cancel the Start in flight, and starting Ollama would wait for vLLM.
 		defer func() {
 			b.engineConfigMu.Lock()
 			defer b.engineConfigMu.Unlock()
 			b.reconcileLegacySettingsLocked()
 		}()
-	case isEnginePortAssignment || msg.Method == "engine:start" || msg.Method == "engine:restart":
-		b.engineConfigMu.Lock()
-		defer b.engineConfigMu.Unlock()
-		defer b.reconcileLegacySettingsLocked()
 	}
 	isOllamaPortAssignment := isEnginePortAssignment && requestedEngine == "ollama"
 	if isEnginePortAssignment && b.rejectOllamaHostAliasPort(msg, requestedPort, requestedEngine) {

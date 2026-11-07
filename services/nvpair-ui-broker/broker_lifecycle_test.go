@@ -321,3 +321,130 @@ func TestRelayToEngine_DeliversAStopWhileAStartIsWaitingForReadiness(t *testing.
 		}
 	}
 }
+
+// vLLM can take minutes to become ready. Starting or restarting another engine
+// meanwhile has to go ahead: the engine manager orders operations per engine,
+// so nothing in the broker should make llama.cpp wait for vLLM.
+func TestRelayToEngine_StartsOtherEnginesWhileAStartIsWaitingForReadiness(t *testing.T) {
+	worker, engineManager := newTestRPCWorkerPipe(t)
+	brokerConn, clientConn := net.Pipe()
+	t.Cleanup(func() {
+		_ = brokerConn.Close()
+		_ = clientConn.Close()
+	})
+	b := &Broker{codec: NewCodec(brokerConn)}
+	b.setEngineMgr(worker)
+	replies := make(chan *Message, 3)
+	go func() {
+		client := NewCodec(clientConn)
+		for {
+			msg, err := client.Read()
+			if err != nil {
+				return
+			}
+			replies <- msg
+		}
+	}()
+
+	othersArrived := make(chan struct{})
+	go func() {
+		var vllmStart *Message
+		others := 0
+		for {
+			request, err := engineManager.Read()
+			if err != nil {
+				return
+			}
+			var p struct {
+				Engine string `json:"engine"`
+			}
+			_ = json.Unmarshal(request.Params, &p)
+			if p.Engine == "vllm" {
+				vllmStart = request // held: vLLM is still loading
+				continue
+			}
+			_ = engineManager.Respond(request.ID, map[string]any{"engine": p.Engine, "running": true})
+			if others++; others == 2 {
+				close(othersArrived)
+				_ = engineManager.Respond(vllmStart.ID, map[string]any{"engine": "vllm", "running": true})
+				return
+			}
+		}
+	}()
+
+	vllmID, llamacppID, lmstudioID := json.RawMessage(`1`), json.RawMessage(`2`), json.RawMessage(`3`)
+	b.relayToEngine(&Message{JSONRPC: "2.0", ID: &vllmID, Method: "engine:start", Params: json.RawMessage(`{"engine":"vllm"}`)})
+	time.Sleep(100 * time.Millisecond) // vLLM's Start is in flight
+	b.relayToEngine(&Message{JSONRPC: "2.0", ID: &llamacppID, Method: "engine:start", Params: json.RawMessage(`{"engine":"llamacpp"}`)})
+	b.relayToEngine(&Message{JSONRPC: "2.0", ID: &lmstudioID, Method: "engine:restart", Params: json.RawMessage(`{"engine":"lmstudio"}`)})
+
+	select {
+	case <-othersArrived:
+	case <-time.After(5 * time.Second):
+		require.FailNow(t, "starting llama.cpp and restarting LM Studio waited for vLLM's Start")
+	}
+	for range 3 {
+		select {
+		case <-replies:
+		case <-time.After(5 * time.Second):
+			require.FailNow(t, "the three operations were not all answered")
+		}
+	}
+}
+
+// A Start that assigns a port changes the launch settings, so it still waits
+// for the settings lock, which a settings Apply holds while it checks ports.
+// A Start that assigns none goes ahead.
+func TestRelayToEngine_KeepsAStartThatAssignsAPortBehindTheSettingsLock(t *testing.T) {
+	worker, engineManager := newTestRPCWorkerPipe(t)
+	brokerConn, clientConn := net.Pipe()
+	t.Cleanup(func() {
+		_ = brokerConn.Close()
+		_ = clientConn.Close()
+	})
+	b := &Broker{codec: NewCodec(brokerConn)}
+	b.setEngineMgr(worker)
+	go func() {
+		client := NewCodec(clientConn)
+		for {
+			if _, err := client.Read(); err != nil {
+				return
+			}
+		}
+	}()
+	arrived := make(chan string, 2)
+	go func() {
+		for {
+			request, err := engineManager.Read()
+			if err != nil {
+				return
+			}
+			arrived <- string(request.Params)
+			_ = engineManager.Respond(request.ID, map[string]any{"running": true})
+		}
+	}()
+
+	b.engineConfigMu.Lock() // a settings Apply is checking ports
+	withPort, withoutPort := json.RawMessage(`1`), json.RawMessage(`2`)
+	b.relayToEngine(&Message{JSONRPC: "2.0", ID: &withPort, Method: "engine:start", Params: json.RawMessage(`{"engine":"llamacpp","port":8090}`)})
+	b.relayToEngine(&Message{JSONRPC: "2.0", ID: &withoutPort, Method: "engine:start", Params: json.RawMessage(`{"engine":"lmstudio"}`)})
+
+	select {
+	case params := <-arrived:
+		require.JSONEq(t, `{"engine":"lmstudio"}`, params, "the Start that assigns a port went ahead while the settings lock was held")
+	case <-time.After(5 * time.Second):
+		require.FailNow(t, "the Start that assigns no port waited for the settings lock")
+	}
+	select {
+	case params := <-arrived:
+		require.FailNow(t, "the Start that assigns a port went ahead while the settings lock was held", params)
+	case <-time.After(300 * time.Millisecond):
+	}
+	b.engineConfigMu.Unlock()
+	select {
+	case params := <-arrived:
+		require.JSONEq(t, `{"engine":"llamacpp","port":8090}`, params)
+	case <-time.After(5 * time.Second):
+		require.FailNow(t, "the Start that assigns a port never went ahead once the lock was free")
+	}
+}
